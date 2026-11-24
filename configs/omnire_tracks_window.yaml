@@ -1,0 +1,290 @@
+# Best configuration so far (Waymo seq 023, every 10th frame held out, held-out frames posed by cubic interpolation):
+#   people as 3445 tracked mesh points + the `window` motion MLP, trained with half of the people hidden per step.
+#   run humans_motion_window_023_ho10: 32.12 PSNR per image, 28.29 human box, 28.99 vehicle box, no held-out images used
+#   (SMPL baseline baseline_masked_fixdepth_023_ho10: 31.89 / 28.05 / 28.87). One seed, one sequence.
+# Lighter variant, 1200 tracks and 1200 Gaussians per person (32.09 / 28.21):
+#   model.SMPLNodes.ctrl.n_tracks=1200 model.SMPLNodes.ctrl.n_gaussians=1200
+#
+# Recipe (tracks_path below must exist; it is an export, not part of the repo):
+#   1. train configs/omnire_masked.yaml -> work_dirs/sdfgs/baseline_masked_fixdepth_023_ho10
+#   2. python tools/export_point_tracks.py work_dirs/sdfgs/baseline_masked_fixdepth_023_ho10 --n_points 3445 --suffix _3445
+#   3. python tools/train.py --config_file configs/omnire_tracks_window.yaml --output_root ./work_dirs --project sdfgs \
+#        --run_name humans_motion_window_023_ho10 data.scene_idx=23 data.preload_device=cpu data.pixel_source.test_image_stride=10 \
+#        render.render_full=False render.eval_chunk_len=25 logging.saveckpt_freq=30000
+#   4. python tools/eval_human_poses.py <run_dir> --modes cubic --rigid_modes
+seed: 0
+dataset: waymo/3cams
+trainer:
+  type: models.trainers.MultiTrainer
+  optim:
+    num_iters: 30000
+    use_grad_scaler: false
+    cache_buffer_freq: -1
+  render:
+    near_plane: 0.1
+    far_plane: 10000000000.0
+    antialiased: false
+    packed: false
+    absgrad: true
+    sparse_grad: false
+    batch_size: 1
+  losses:
+    rgb:
+      w: 0.8
+    ssim:
+      w: 0.2
+    mask:
+      w: 0.05
+      opacity_loss_type: bce
+    depth:
+      w: 0.01
+      inverse_depth: false
+      normalize: false
+      loss_type: l1
+    affine:
+      w: 1.0e-05
+  res_schedule:
+    double_steps: 250
+    downscale_times: 2
+  gaussian_optim_general_cfg:
+    xyz:
+      lr: 0.00016
+      lr_final: 1.6e-06
+      scale_factor: scene_radius
+    sh_dc:
+      lr: 0.0025
+    sh_rest:
+      lr: 0.000125
+    opacity:
+      lr: 0.05
+    scaling:
+      lr: 0.005
+    rotation:
+      lr: 0.001
+  gaussian_ctrl_general_cfg:
+    warmup_steps: 500
+    reset_alpha_interval: 3000
+    refine_interval: 100
+    sh_degree_interval: 1000
+    n_split_samples: 2
+    reset_alpha_value: 0.01
+    densify_grad_thresh: 0.0005
+    densify_size_thresh: 0.003
+    cull_alpha_thresh: 0.005
+    cull_scale_thresh: 0.5
+    cull_screen_size: 0.15
+    split_screen_size: 0.05
+    stop_screen_size_at: 4000
+    stop_split_at: 15000
+    sh_degree: 3
+model:
+  Background:
+    type: models.gaussians.VanillaGaussians
+    init:
+      from_lidar:
+        num_samples: 800000
+        return_color: true
+      filter_moving_thres: 0.5
+      near_randoms: 100000
+      far_randoms: 100000
+    reg:
+      sharp_shape_reg:
+        w: 1.0
+        step_interval: 10
+        max_gauss_ratio: 10.0
+  RigidNodes:
+    type: models.nodes.RigidNodes
+    init:
+      instance_max_pts: 5000
+      only_moving: true
+      traj_length_thres: 1.0
+      annotator_masks: ../MaskPtAnnotator/annotator_output/{scene_idx:03d}/masks_npz
+    ctrl:
+      cull_scale_thresh: 0.1
+      stop_screen_size_at: 30000
+      stop_split_at: 20000
+      cull_out_of_bound: true
+    reg:
+      sharp_shape_reg:
+        w: 1.0
+        step_interval: 10
+        max_gauss_ratio: 10.0
+      temporal_smooth_reg:
+        trans:
+          w: 0.01
+          smooth_range: 5
+    optim:
+      ins_rotation:
+        lr: 1.0e-05
+        lr_final: 5.0e-06
+      ins_translation:
+        lr: 0.0005
+        lr_final: 0.0001
+  DeformableNodes:
+    type: models.nodes.DeformableNodes
+    init:
+      instance_max_pts: 5000
+      only_moving: true
+      traj_length_thres: 0.5
+      annotator_masks: ../MaskPtAnnotator/annotator_output/{scene_idx:03d}/masks_npz
+    networks:
+      D: 8
+      W: 256
+      embed_dim: 16
+      x_multires: 10
+      t_multires: 10
+      deform_quat: true
+      deform_scale: false
+    ctrl:
+      reset_alpha_value: 0.1
+      cull_scale_thresh: 0.1
+      stop_screen_size_at: 30000
+      stop_split_at: 20000
+      sh_degree: 3
+      cull_out_of_bound: false
+      use_deformgs_for_nonrigid: true
+      use_deformgs_after: 3000
+      stop_optimizing_canonical_xyz: true
+    reg:
+      sharp_shape_reg:
+        w: 1.0
+        step_interval: 10
+        max_gauss_ratio: 10.0
+      out_of_bound_loss:
+        w: 1.0
+        stop_after: 30000
+      temporal_smooth_reg:
+        trans:
+          w: 0.01
+          smooth_range: 5
+    optim:
+      xyz:
+        lr: 0.00016
+        lr_final: 1.6e-06
+        scale_factor: 2.0
+      embedding:
+        lr: 0.001
+        lr_final: 0.0001
+      deform_network:
+        lr: 0.0016
+        lr_final: 0.00016
+        scale_factor: 5.0
+      ins_rotation:
+        lr: 1.0e-05
+        lr_final: 5.0e-06
+      ins_translation:
+        lr: 0.0005
+        lr_final: 0.0001
+  SMPLNodes:
+    type: models.nodes.TrackNodes
+    init:
+      only_moving: true
+      traj_length_thres: 0.5
+      annotator_masks: ../MaskPtAnnotator/annotator_output/{scene_idx:03d}/masks_npz
+    reg:
+      sharp_shape_reg:
+        w: 1.0
+        step_interval: 10
+        max_gauss_ratio: 10.0
+      knn_reg:
+        lambda_std_q: 0.001
+        lambda_std_s: 0.001
+        lambda_std_o: 0.001
+        lambda_std_shs_dc: 0.001
+        lambda_std_shs_rest: 0.001
+      max_s_square_reg:
+        w: 0.05
+      x_offset:
+        w: 0.2
+      motion_reg:
+        w: 0.01
+      body_sdf:
+        enabled: false
+        'n': 2048
+        surface_w: 1.0
+        eikonal_w: 0.01
+        off_w: 0.1
+        gs_w: 0.1
+        gs_start: 1000
+    optim:
+      xyz:
+        lr: 0.00016
+        lr_final: 1.6e-06
+        scale_factor: 3.0
+      rotation:
+        lr: 0.005
+      sh_dc:
+        lr: 0.005
+      sh_rest:
+        lr: 0.00025
+      motion:
+        lr: 0.0005
+        lr_final: 5.0e-05
+      body_sdf:
+        lr: 0.0005
+        lr_final: 5.0e-05
+    ctrl:
+      sh_degree: 1
+      opacity_init_value: 0.99
+      ball_gaussians: false
+      constrain_xyz_offset: false
+      knn_update_interval: 100
+      knn_neighbors: 3
+      use_voxel_deformer: false
+      test_interp: cubic
+      freeze_x: false
+      freeze_o: false
+      freeze_q: false
+      freeze_s: false
+      freeze_shs_dc: false
+      freeze_shs_rest: false
+      tracks_path: work_dirs/sdfgs/baseline_masked_fixdepth_023_ho10/exports/point_tracks_trained_3445.npz
+      n_kabsch: 12
+      bind_k: 4
+      motion:
+        mode: window
+        p_hide: 0.5
+        hidden: 128
+        depth: 4
+        max_offset: 0.1
+      n_tracks: 0
+      n_gaussians: 0
+  Sky:
+    type: models.modules.EnvLight
+    params:
+      resolution: 1024
+    optim:
+      all:
+        lr: 0.01
+  Affine:
+    type: models.modules.AffineTransform
+    params:
+      embedding_dim: 4
+      base_mlp_layer_width: 64
+      pixel_affine: false
+    optim:
+      all:
+        lr: 1.0e-05
+        weight_decay: 1.0e-06
+  CamPose:
+    type: models.modules.CameraOptModule
+    optim:
+      all:
+        lr: 1.0e-05
+        weight_decay: 1.0e-06
+render:
+  fps: 10
+  render_full: true
+  render_test: true
+  render_novel:
+    traj_types:
+    - front_center_interp
+    fps: 24
+  vis_lidar: true
+  vis_sky: true
+  vis_error: false
+logging:
+  vis_freq: 2000
+  print_freq: 500
+  saveckpt_freq: 5000
+  save_seperate_video: true
